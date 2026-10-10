@@ -44,6 +44,7 @@ def generate_matmul_transform(
     accum_type: str = "f32",
     contract_input_type: str = None,
     bf16_emulation: bool = False,
+    k_loop: bool = False,
 ) -> str:
     """Generate a matmul transform dialect MLIR script.
 
@@ -80,6 +81,12 @@ def generate_matmul_transform(
             i8 matmul with a cast here lowers with the wrong MAC signedness.
         bf16_emulation: Shorthand for contract_input_type="bf16". If True
             and contract_input_type is None, sets contract_input_type="bf16".
+        k_loop: The matmul sits in the kernel's own K loop (an ``scf.for``
+            carrying the accumulator, as ``acc = tl.dot(a, b, acc)`` in a
+            ``for k`` loop gives). The loop then carries the packed L1
+            accumulator, its pointer offsets are computed from the induction
+            variable, and the L2 staging buffers are allocated once outside
+            it.
 
     Returns:
         Complete MLIR module string with transform.with_named_sequence.
@@ -159,6 +166,26 @@ def generate_matmul_transform(
         transform.loop.unroll %vec_loops_to_unroll#0 factor = 2 : !transform.any_op
 
 """
+    # The kernel's own K loop: computed offsets, a packed accumulator carried
+    # through it, L2 staging allocated once.
+    k_loop_offsets, acc_pack, hoist_allocs = "", "%pack_c", ""
+    if k_loop:
+        k_loop_offsets = """
+        %k_loops_in = transform.structured.match ops{["scf.for"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %k_loops_iv = transform.air.fold_iter_args_into_induction_var %k_loops_in : (!transform.any_op) -> !transform.any_op
+        %func_k_loop = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.apply_patterns to %func_k_loop {
+            transform.apply_patterns.canonicalization
+        } : !transform.any_op
+        %k_loops = transform.structured.match ops{["scf.for"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.annotate %k_loops "kernel_k_loop" : !transform.any_op
+"""
+        acc_pack = "%acc_pack"
+        hoist_allocs = """
+        %func_hoist = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.air.hoist_static_alloc %func_hoist : (!transform.any_op) -> ()
+"""
+
     # Phase 10 takes every herd; there is no herd to leave alone.
     herd_vectorize_filter = ""
     phase_11_12 = f"""\
@@ -212,7 +239,7 @@ module attributes {{transform.with_named_sequence}} {{
     // Tile memref copies for streaming data from DDR (L3) to MemTile (L2).
     //==========================================================================
 
-        %func10 = transform.structured.match ops{{["func.func"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
+{k_loop_offsets}        %func10 = transform.structured.match ops{{["func.func"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
         %func10_updated = transform.air.convert_memref_copy_to_linalg_copy %func10 : (!transform.any_op) -> !transform.any_op
         %copies = transform.structured.match ops{{["linalg.copy"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
         %copy1, %copy2 = transform.split_handle %copies : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -267,8 +294,19 @@ module attributes {{transform.with_named_sequence}} {{
           outer_perm = [1, 0] : (!transform.any_op, !transform.any_op)
           -> (!transform.any_op, !transform.any_op, !transform.any_op)
 
-        // Promote C pack to L1
-        %output_l1_pack_op_source_buffer, %output_l1_pack_op_new = transform.structured.bufferize_to_allocation %pack_c
+{"" if not k_loop else """        // The K loop carries the packed accumulator: pack once before it and
+        // unpack once after. A loop of one step has been folded away, and then
+        // the pack is already outside any loop.
+        transform.annotate %pack_c "acc_pack" : !transform.any_op
+        %k_loop = transform.structured.match ops{["scf.for"]} attributes{kernel_k_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.foreach %k_loop : !transform.any_op {
+        ^bb0(%loop: !transform.any_op):
+          %k_loop_packed, %hoisted_pack = transform.air.hoist_loop_carried_pack %loop : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        }
+        %acc_pack = transform.structured.match ops{["linalg.pack"]} attributes{acc_pack} in %arg1 : (!transform.any_op) -> !transform.any_op
+
+"""}        // Promote C pack to L1
+        %output_l1_pack_op_source_buffer, %output_l1_pack_op_new = transform.structured.bufferize_to_allocation {acc_pack}
             <{{memory_space = 2, bufferize_destination_only, memcpy_op = "linalg.copy", emit_dealloc}}> : !transform.any_op
 
         // Annotate for robust matching after K-tiling
@@ -365,7 +403,7 @@ module attributes {{transform.with_named_sequence}} {{
         }} : !transform.any_op
         %func_op_updated = transform.air.remove_uninitialized_copy %func6 : (!transform.any_op) -> !transform.any_op
         %func_op_updated_1 = transform.air.eliminate_cascade_memcpy %func_op_updated : (!transform.any_op) -> !transform.any_op
-
+{hoist_allocs}
     //==========================================================================
     // PHASE 8: FUSE LOOPS FOR L2 PINGPONG BUFFERING
     //==========================================================================
