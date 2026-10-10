@@ -1488,10 +1488,17 @@ def _matmul_transform_params(info, npu_version):
             l2_k = v
             break
 
+    # In a kernel K loop each step is one L2 tile, and the tile above is the
+    # per-core one inside it.
+    l1_k = None
+    if info.get("k_loop", False):
+        l1_k, l2_k = l2_k, k
+
     return {
         "l1_m": l1_m,
         "l1_n": l1_n,
         "l2_k": l2_k,
+        "l1_k": l1_k,
         "pack_sizes": (pack_m, pack_n, pack_k),
         "accum_type": accum_type,
         "contract_input_type": contract_input_type,
