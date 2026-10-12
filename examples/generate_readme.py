@@ -52,6 +52,12 @@ EXAMPLES = [
     },
     {
         "category": "Matrix",
+        "name": "Matrix Multiplication (BF16, K Loop)",
+        "path": "matmul_bf16_k_loop",
+        "datatypes": "bf16",
+    },
+    {
+        "category": "Matrix",
         "name": "Matrix Multiplication (Autotune)",
         "path": "autotune-matmul",
         "datatypes": "bf16",
