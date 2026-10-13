@@ -420,9 +420,9 @@ def _dense_qkv_post(G, dev):
             kv=(slab[L], pos, geom),
             dense_kv=True,
         )
-        ok &= check(f"{name} q", gq, q, 1e-5)
-        ok &= check(f"{name} k", gk, k, 1e-5)
-        ok &= check(f"{name} v", gv, v, 1e-5)
+        ok &= check(f"{name} q", gq.cpu(), q, 1e-5)
+        ok &= check(f"{name} k", gk.cpu(), k, 1e-5)
+        ok &= check(f"{name} v", gv.cpu(), v, 1e-5)
         # The cache bytes: the host writer, fed this kernel's own K and V so
         # that bf16 rounding cannot differ.
         want = torch.zeros(geom.slab_shape(), dtype=torch.bfloat16)
@@ -457,7 +457,7 @@ def _dense_attn_decode(G, dev):
             p = torch.softmax((kh @ qh)[..., 0] * dh**-0.5, -1)
             want = (p[:, None, :] @ vh)[:, 0].reshape(1, -1)
             got = G.attn_decode_gqa(q.to(dev), slab_d[1], geom, nq, nkv, dh, S, lo=lo)
-            ok &= check(f"{name} S={S} lo={lo}", got, want, 1e-2)
+            ok &= check(f"{name} S={S} lo={lo}", got.cpu(), want, 1e-2)
     return ok
 
 

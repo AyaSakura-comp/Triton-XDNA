@@ -583,12 +583,11 @@ runs:
           fi
 
           # The Llama-family iGPU forward (`LlamaGpuDecode`), on the smallest
-          # model. iGPU prefill then iGPU decode; the Triton NPU prefill
-          # writing the iGPU decoder's shared cache; and the iGPU prefill
-          # writing the NPU decoder's, through the zero-copy path above.
+          # model: iGPU prefill then iGPU decode, and the Triton NPU prefill
+          # writing the iGPU decoder's shared cache. Both gate the recorded
+          # iGPU continuation.
           for args in "--prefill-engine igpu --decode gpu --max-tokens 9 --greedy" \
-                      "--prefill-engine triton --backend npu --decode gpu --max-tokens 9 --greedy" \
-                      "--prefill-engine igpu --max-tokens 8 --greedy"; do
+                      "--prefill-engine triton --backend npu --decode gpu --max-tokens 9 --greedy"; do
             echo "--- igpu: llama32_1b_q4nx $args ---"
             rc=0
             ( cd examples/llama32_1b_q4nx \
@@ -600,6 +599,32 @@ runs:
               hetero_rc=1
             fi
           done
+
+          # The iGPU prefill writing the NPU decoder's cache, through the
+          # zero-copy path. No continuation is recorded for this pair yet, so
+          # the exit status covers the first token only; the handoff itself is
+          # checked by its marker, as for the zero-copy row above.
+          echo "--- igpu prefill, npu decode: llama32_1b_q4nx ---"
+          rc=0
+          zc_out=$( cd examples/llama32_1b_q4nx \
+            && python llama32_1b_q4nx_inference.py --prefill-engine igpu \
+                 --max-tokens 8 --greedy 2>&1 ) || rc=$?
+          echo "$zc_out"
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: llama32_1b_q4nx igpu prefill, npu decode (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: llama32_1b_q4nx igpu prefill, npu decode (exit $rc)"
+            hetero_rc=1
+          elif echo "$zc_out" | grep -q "KV handed over in place" \
+               && ! echo "$zc_out" | grep -q "copied once"; then
+            echo "PASS: llama32_1b_q4nx igpu prefill handed its KV to the NPU decode in place"
+          elif echo "$zc_out" | grep -q "XRT zero-copy unavailable"; then
+            echo "SKIP: llama32_1b_q4nx igpu prefill, npu decode -- no shared pages here"
+          else
+            echo "FAIL: llama32_1b_q4nx igpu prefill gated green but the KV handoff"
+            echo "      neither engaged nor reported it was unavailable."
+            hetero_rc=1
+          fi
 
           # Each iGPU decode step against a prefill re-run over the growing
           # prefix, after both the host and the iGPU prefill.

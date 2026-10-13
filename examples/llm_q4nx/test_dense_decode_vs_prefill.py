@@ -97,38 +97,40 @@ def main():
     for ids in prompts:
         P = len(ids)
         m.bind_kv_sink(None)
-        seq, oracle = list(ids), []
+        seq, oracle, scores = list(ids), [], []
         for _ in range(a.tokens):
             m.clear_context()
-            oracle.append(int(torch.as_tensor(m.prefill(seq)).argmax()))
+            scores.append(torch.as_tensor(m.prefill(seq)).float())
+            oracle.append(int(scores[-1].argmax()))
             seq.append(oracle[-1])
         print(f"prompt (P={P}) {ids if P <= 8 else ids[:8] + ['...']}")
         print(f"  prefill oracle : {oracle}")
 
         host_kv = None
-        if dec.kv_slab is None:
-            print("  host -> gpu    : SKIP, the cache is not in shared pages here")
+        try:
+            sink = dec.kv_sink()
+        except RuntimeError as e:
+            print(f"  host -> gpu    : SKIP, {e}")
         else:
             dec._slab_t.zero_()
-            m.bind_kv_sink(dec.kv_sink())
+            m.bind_kv_sink(sink)
             m.clear_context()
             first = int(torch.as_tensor(m.prefill(ids)).argmax())
             host_kv = rows(P)
             got = dec.generate(first, n_tokens=a.tokens, eos=())
-            good = got == oracle
+            good, note = _agrees(got, oracle, scores)
             ok &= good
-            print(f"  host -> gpu    : {got}   {'ok' if good else 'MISMATCH'}")
+            print(f"  host -> gpu    : {got}{note}   {'ok' if good else 'MISMATCH'}")
             m.bind_kv_sink(None)
 
         dec.prefill(ids)
         got = dec.generate(n_tokens=a.tokens, eos=())
-        good = got == oracle
-        note = ""
+        good, note = _agrees(got, oracle, scores)
         if host_kv is not None:
             kv = rows(P)
             diff = ((kv - host_kv).norm() / host_kv.norm()).item()
             good &= diff < 5e-2
-            note = f"   KV rel {diff:.1e}"
+            note += f"   KV rel {diff:.1e}"
         ok &= good
         print(f"  gpu prefill    : {got}{note}   {'ok' if good else 'MISMATCH'}")
 
@@ -142,6 +144,20 @@ def main():
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _agrees(got, oracle, scores):
+    """Whether `got` is a greedy continuation the oracle's own logits allow.
+
+    Where the oracle's logits tie exactly between its token and `got`'s, both
+    are greedy, and the sequences part there; they are compared up to it.
+    """
+    for i, (g, o) in enumerate(zip(got, oracle)):
+        if g != o:
+            if scores[i][g] == scores[i][o]:
+                return True, f"   (oracle ties {o} and {g} at step {i})"
+            return False, ""
+    return len(got) == len(oracle), ""
 
 
 def _prefill_cls(example):
