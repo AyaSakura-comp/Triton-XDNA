@@ -109,6 +109,18 @@ from kernels import (
 
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
+#: The 64x128 matmul schedule with an epilogue herd, for gate and up writing
+#: bf16 (the gate through gelu_tanh), and the K step it is written for.
+EPI_SCRIPT = "llm_q4nx/transform_matmul_epilogue_aie2p.mlir"
+EPI_L2_K = 32
+#: The bf16 multiply that joins gate and up.
+MUL_SCRIPT = "qwen2_5/transform_add_aie2p.mlir"
+#: From this many rows per chain, gate (gelu_tanh in its epilogue) and up write
+#: bf16 and a multiply joins them. Narrower chains keep the f32 planes and the
+#: merge, which are faster there. Q4NX_FFN_GATE_EPILOGUE=0 keeps them at every
+#: width.
+GATE_EPILOGUE_MIN_ROWS = 512
+_GATE_EPILOGUE = os.environ.get("Q4NX_FFN_GATE_EPILOGUE", "1") == "1"
 #: The f32 variant: these operands are produced on-device by the GEMMs before
 #: it and never touch the host, so they are still f32 rather than bf16.
 #: It splits the range over four of npu2's eight columns. Widening it to eight
@@ -148,23 +160,35 @@ def _plan_down(inter):
     return inter, inter
 
 
-def _mm_op(rows, k, n, block_m, block_n, a_stride, l2_k=L2_K):
+def _mm_op(
+    rows,
+    k,
+    n,
+    block_m,
+    block_n,
+    a_stride,
+    l2_k=L2_K,
+    out_dtype=torch.float32,
+    constexprs=None,
+):
     """`chain.add` arguments for `_mm_kernel` over a `rows x k @ k x n` GEMM.
 
     Shape-representative placeholders; only shapes and dtypes drive the
     lowering. `l2_k` is the schedule's, and `k` must be a multiple of it.
+    `out_dtype` and `constexprs` are for `_mm_bf16_kernel`.
     """
     if k % l2_k:
         raise ValueError(f"K={k} is not a multiple of the schedule's l2_k={l2_k}")
     tA = torch.zeros((rows, a_stride), dtype=torch.bfloat16)
     tB = torch.zeros((k, n), dtype=torch.bfloat16)
-    tC = torch.zeros((rows, n), dtype=torch.float32)
+    tC = torch.zeros((rows, n), dtype=out_dtype)
     return {
         "args": (tA, tB, tC, rows, n, k, a_stride, 1, n, 1, n, 1),
         "constexprs": {
             "BLOCK_SIZE_M": block_m,
             "BLOCK_SIZE_N": block_n,
             "BLOCK_SIZE_K": l2_k,
+            **(constexprs or {}),
         },
     }
 
@@ -244,6 +268,55 @@ def _add_f32(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
 
 @triton.jit
+def _mm_bf16_kernel(
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    sam: tl.constexpr,
+    sak: tl.constexpr,
+    sbk: tl.constexpr,
+    sbn: tl.constexpr,
+    scm: tl.constexpr,
+    scn: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GELU: tl.constexpr,
+    C2: tl.constexpr,
+    KG: tl.constexpr,
+):
+    """`_mm_kernel` writing bf16, with gelu_tanh applied first when `GELU`."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + offs_m[:, None] * sam + offs_k[None, :] * sak
+    b_ptrs = B + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+    tl.static_assert(K % BLOCK_SIZE_K == 0)
+    c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, K // BLOCK_SIZE_K):
+        c = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), c)
+        a_ptrs += BLOCK_SIZE_K * sak
+        b_ptrs += BLOCK_SIZE_K * sbk
+    if GELU:
+        y = (C2 * 0.5) * (c + KG * c * c * c)
+        c = 0.5 * c * (1.0 + tl.extra.cuda.libdevice.tanh(y))
+    tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, c.to(tl.bfloat16))
+
+
+@triton.jit
+def _mul_bf16(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    """C = A * B over three bf16 buffers."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(C + offsets[:], tl.load(A + offsets[:]) * tl.load(B + offsets[:]))
+
+
+@triton.jit
 def _geglu_f32in(
     G,
     U,
@@ -302,6 +375,9 @@ class FusedMLP:
         5 H    bf16 (rows * HID)      intermediate
         6 Bd   bf16 (HID, D_pad)      static
         7 OUT   f32 (rows, D_pad)     output
+
+    `Cg` and `Cu` are bf16 in a chain of at least `GATE_EPILOGUE_MIN_ROWS`
+    rows, where they hold gelu_tanh(gate) and up and `H` is their product.
 
     `K_exact` is D; `K_stride` is A's row stride, at least D and held off a
     power of two (`kernels.unaliased_stride`).
@@ -537,7 +613,16 @@ class FusedMLP:
         tOut = torch.zeros((M, D_pad), dtype=torch.float32)
         tOutf = torch.zeros(M * D_pad, dtype=torch.float32)
 
-        chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
+        # The gate epilogue's GELU is f32 math, which runs on the bf16 datapath.
+        epilogue = self._gate_epilogue(M)
+        chain = NPUChain(
+            f"q4nx_mlp{'e' if epilogue else ''}_{self.H}_m{M}",
+            bf16_emulation=True if epilogue else None,
+        )
+        if epilogue:
+            self._add_gate_up_epilogue(chain, M, gu_m, gu_n)
+            self._chains[M] = self._add_down(chain, M, dn_m, dn_n, dn_script, dn_l2_k)
+            return self._chains[M]
         gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
         gu_op = _mm_op(M, K_exact, HID, gu_m, gu_n, self.K_stride)
         for src, dst in gemms:
@@ -563,7 +648,53 @@ class FusedMLP:
             constexprs={"BLOCK_SIZE": merge_block},
             transform_script=script(MERGE_SCRIPT),
         )
-        # down, contracting the whole FFN width in one op.
+        self._chains[M] = self._add_down(chain, M, dn_m, dn_n, dn_script, dn_l2_k)
+        return chain
+
+    @staticmethod
+    def _gate_epilogue(M):
+        """Whether the chain for `M` rows runs gate and up with epilogues."""
+        return _GATE_EPILOGUE and M >= GATE_EPILOGUE_MIN_ROWS
+
+    def _add_gate_up_epilogue(self, chain, M, gu_m, gu_n):
+        """gate (gelu_tanh in its epilogue) and up writing bf16, then their product."""
+        HID = self.HID
+        epi = script(EPI_SCRIPT)
+        for src, dst, gelu in (
+            (self.BG_I, self.CG_I, True),
+            (self.BU_I, self.CU_I, False),
+        ):
+            chain.add(
+                _mm_bf16_kernel,
+                grid=(M // gu_m, HID // gu_n),
+                arg_map={0: self.A_I, 1: src, 2: dst},
+                transform_script=epi,
+                **_mm_op(
+                    M,
+                    self.K_exact,
+                    HID,
+                    gu_m,
+                    gu_n,
+                    self.K_stride,
+                    l2_k=EPI_L2_K,
+                    out_dtype=torch.bfloat16,
+                    constexprs={"GELU": gelu, "C2": _GELU_2C, "KG": _GELU_K},
+                ),
+            )
+        t = torch.zeros(M * HID, dtype=torch.bfloat16)
+        block = elem_block(M * HID, 2 + 2 + 2)
+        chain.add(
+            _mul_bf16,
+            grid=((M * HID) // block,),
+            arg_map={0: self.CG_I, 1: self.CU_I, 2: self.H_I},
+            args=(t, t, t, M * HID),
+            constexprs={"BLOCK_SIZE": block},
+            transform_script=script(MUL_SCRIPT),
+        )
+
+    def _add_down(self, chain, M, dn_m, dn_n, dn_script, dn_l2_k):
+        """`down` into OUT, contracting the whole FFN width in one op."""
+        HID, D_pad = self.HID, self.D_pad
         chain.add(
             _mm_kernel,
             grid=(M // dn_m, D_pad // dn_n),
@@ -571,7 +702,6 @@ class FusedMLP:
             transform_script=dn_script,
             **_mm_op(M, HID, D_pad, dn_m, dn_n, HID, l2_k=dn_l2_k),
         )
-        self._chains[M] = chain
         return chain
 
     # ---- dispatch ----
@@ -632,8 +762,9 @@ class FusedMLP:
                 args[self.BD_I] = _host(Bd)
                 # The gate's output is bf16 where its drain herd applied the
                 # activation, and f32 where the merge still has to.
-                args[self.CG_I] = np.empty((M, HID), dtype=np.float32)
-                args[self.CU_I] = np.empty((M, HID), dtype=np.float32)
+                plane = bfloat16 if self._gate_epilogue(M) else np.float32
+                args[self.CG_I] = np.empty((M, HID), dtype=plane)
+                args[self.CU_I] = np.empty((M, HID), dtype=plane)
                 args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
                 for i in (self.OUT_I, *partials, *sums):
                     args[i] = np.empty((M, D_pad), dtype=np.float32)
