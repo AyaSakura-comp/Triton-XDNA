@@ -44,6 +44,12 @@ assert DQ != D, "Gemma3-4B has a decoupled q dim; o_proj contracts DQ -> D"
 # uses. The norm weights are fed as-is at this eps -- see `load_q4nx`.
 RMS_EPS = 1e-6
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = False
+#: The GLU's activation, for the iGPU forward's fused GLU kernels.
+GLU_ACT = "gelu_tanh"
+
+
 #: Gemma3's dual-theta RoPE. Five layers in six are "local" (theta 1e4, no
 #: position scaling, attention limited to a 1024-token sliding window); every
 #: sixth is "global" (theta 1e6 with positions divided by 8, unbounded
@@ -215,3 +221,17 @@ def rope_lut(seq_len, dtype=None, global_layer=False):
     lf = ROPE_GLOBAL_LINEAR_FACTOR if global_layer else 1.0
     lut = np.stack([generate_rope_lut(p, theta, lf) for p in range(seq_len)])
     return lut.astype(dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The projections in Codec B, still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`."""
+    _add_air_paths()
+    import gemma3_4b_q4nx_weights as gw
+
+    qm = gw.Q4nxModel(model or MODEL_DEFAULT)
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    return packed_bundle(qm, sys.modules[__name__], n_layers)
