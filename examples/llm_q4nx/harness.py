@@ -646,6 +646,28 @@ def igpu_prefill_cls(cfg, prefill_cls):
     return igpu_prefill_class(prefill_cls)
 
 
+#: The NPU's XRT device, held open once taken; see `hold_npu`.
+_npu = None
+
+
+def hold_npu():
+    """Open the NPU through XRT before torch starts ROCm, and keep it open.
+
+    ROCm's runtime opens the NPU too, as an AIE agent, and holds it; some
+    amdxdna drivers then refuse XRT's open as busy. Whichever opens second
+    must be ROCm, which carries on without its AIE agent. A no-op where there
+    is no pyxrt or no NPU.
+    """
+    global _npu
+    if _npu is None:
+        try:
+            import pyxrt
+
+            _npu = pyxrt.device(0)
+        except Exception:  # noqa: BLE001 -- no NPU here; nothing to order
+            pass
+
+
 def attach_gpu_decoder(cfg, prefiller):
     """Give a host/NPU prefiller its iGPU decoder before it runs.
 
@@ -656,6 +678,8 @@ def attach_gpu_decoder(cfg, prefiller):
     """
     if cfg.MODEL_NAME == "gemma4-e2b" or hasattr(prefiller, "gpu_decoder"):
         return
+    # The decoder starts ROCm, and the prefill has not opened the NPU yet.
+    hold_npu()
     from llama_prefill import LlamaGpuDecode
 
     dec = LlamaGpuDecode(prefiller, max_L=prefiller.max_seq)

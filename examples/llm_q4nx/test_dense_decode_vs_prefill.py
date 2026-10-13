@@ -48,6 +48,12 @@ def main():
     sys.path.insert(0, _HERE)
     sys.path.insert(0, os.path.join(os.path.dirname(_HERE), a.example))
 
+    import harness
+
+    # XRT before ROCm; see `harness.hold_npu`. Only the NPU prefill needs it.
+    if a.backend != "cpu":
+        harness.hold_npu()
+
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device; the decode under test is the GPU one")
         return 77
@@ -56,7 +62,6 @@ def main():
 
     import airsrc
     import config as cfg
-    import harness
     import registry
     from dense_kv_layout import K_REGION, V_REGION, gather
     from llama_prefill import LlamaGpuDecode
