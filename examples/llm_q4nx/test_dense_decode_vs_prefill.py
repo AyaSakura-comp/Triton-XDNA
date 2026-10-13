@@ -14,7 +14,7 @@ time. Against it, for each prompt:
 Run it by hand from this directory, naming the model's example:
 
     python test_dense_decode_vs_prefill.py --example llama32_1b_q4nx \
-        [--tokens 4] [--backend cpu] [--long 600]
+        [--tokens 4] [--backend npu] [--long 600]
 
 Exits 77 without an iGPU, or when the weights or mlir-air's sources cannot
 be had.
@@ -35,7 +35,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--example", default="llama32_1b_q4nx")
     ap.add_argument("--tokens", type=int, default=4)
-    ap.add_argument("--backend", default="npu", choices=("npu", "hetero", "cpu"))
+    # The host forward is the reference the NPU kernels are themselves held
+    # to; an NPU prefill as the oracle would grade the iGPU against its
+    # numerics instead.
+    ap.add_argument("--backend", default="cpu", choices=("npu", "hetero", "cpu"))
     ap.add_argument(
         "--long",
         type=int,
