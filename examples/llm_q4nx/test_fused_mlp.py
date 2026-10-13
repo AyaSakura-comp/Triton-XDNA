@@ -15,7 +15,7 @@ without changing the shape of the answer:
 
 Not an example: `scripts/run_tests.py` runs every *.py directly under an
 example directory, and `llm_q4nx` is excluded from the sweep as a library.
-Invoke it by hand.
+CI runs it from the test action.
 """
 
 from __future__ import annotations
