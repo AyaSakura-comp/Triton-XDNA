@@ -913,7 +913,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             "torch's HIP cannot run in one process."
         )
 
-    fused = fused_prefill_config(cfg, args.max_seq)
+    fused = fused_prefill_config(cfg)
     asked = args.prefill_engine
     if asked == "auto":
         # Depends only on the model, and on --interactive: the interactive
@@ -957,6 +957,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
                 "--prefill-engine air-fused cannot be combined with --interactive "
                 "yet: the interactive session constructs its own prefiller."
             )
+        # Sized here, not above: sizing loads mlir-air's fused runtime, which
+        # the other prefill engines must not need.
+        fused = fused_prefill_config(cfg, args.max_seq)
         prefill_cls = fused_prefill_cls(cfg, prefill_cls, fused)
     if igpu:
         prefill_cls = igpu_prefill_cls(cfg, prefill_cls)
