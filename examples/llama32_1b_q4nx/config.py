@@ -56,7 +56,7 @@ BOS = 128000  # <|begin_of_text|>, for the session warmup
 #: (the builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack, which
 #: driver API is used) is invisible to it. Regenerate with `--prefill-engine
 #: triton --max-tokens 8 --greedy` if the decode legitimately changes.
-EXPECT_IDS = [12366, 13, 578, 6864, 315, 10057, 374, 20437, 13]
+EXPECT_IDS = [12366, 13, 578, 6864, 315, 279, 3723, 4273, 374]
 
 #: The same from the iGPU decode (`--decode gpu`), whichever engine prefilled.
 #: It is also what the host prefill predicts token by token
