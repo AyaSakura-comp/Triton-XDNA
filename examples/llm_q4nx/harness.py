@@ -690,16 +690,29 @@ def attach_gpu_decoder(cfg, prefiller):
     prefiller._gpu_decoder = dec
 
 
-def fused_prefill_config(cfg):
+def fused_prefill_config(cfg, max_seq=None):
     """The `PrefillConfig` of this model's mlir-air fused NPU prefill
-    (`--prefill-engine air-fused`), or None if mlir-air has none."""
+    (`--prefill-engine air-fused`), or None if mlir-air has none.
+
+    A dense model's build holds prompts up to mlir-air's default length for
+    it; a longer `max_seq` asks for a build that holds that many, rounded up
+    to the model's KV block.
+    """
     import triton.language as tl
 
     npu = tl.extra.npu
     try:
-        return npu.PrefillConfig(cfg.MODEL_NAME)
+        config = npu.PrefillConfig(cfg.MODEL_NAME)
     except npu.PrefillConfigError:
         return None
+    if config.dense and max_seq:
+        from dense_fused_prefill import _dense
+
+        desc = _dense()[1].MODELS[config.dense]
+        if max_seq > desc.max_len:
+            n = -(-max_seq // desc.lkp) * desc.lkp
+            config = npu.PrefillConfig(cfg.MODEL_NAME, config.jobs, max_len=n)
+    return config
 
 
 def fused_prefill_cls(cfg, prefill_cls, config):
@@ -900,7 +913,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             "torch's HIP cannot run in one process."
         )
 
-    fused = fused_prefill_config(cfg)
+    fused = fused_prefill_config(cfg, args.max_seq)
     asked = args.prefill_engine
     if asked == "auto":
         # Depends only on the model, and on --interactive: the interactive
