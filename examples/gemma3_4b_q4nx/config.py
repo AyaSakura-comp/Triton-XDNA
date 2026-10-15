@@ -83,6 +83,10 @@ BOS = 2
 #: the decode at all; the first-token gate above is pure prefill.
 EXPECT_IDS = [9079, 236761, 108, 50429, 563, 496, 4185, 3988, 573, 1610]
 
+#: The same after mlir-air's fused prefill, the default engine. Its numerics
+#: move a later greedy token on this model.
+EXPECT_IDS_AIR_FUSED = [9079, 236761, 108, 50429, 563, 3224, 618, 506, 623, 17698]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma3-4B-NPU2")
 
 
