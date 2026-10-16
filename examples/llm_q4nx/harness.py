@@ -72,9 +72,9 @@ def air_inference_module(model):
     """
     # Before the import: mlir-air's module reads its decode-shape selection at
     # import time, so a later choice would not be seen. See
-    # airsrc.select_decode_artifact for why these examples fix it rather than
+    # airsrc.select_decode_artifact for why these examples set it rather than
     # taking mlir-air's default.
-    airsrc.select_decode_artifact()
+    elf = airsrc.select_decode_artifact() == "1"
 
     # Also before the import, and for the same reason: the drivers that take
     # this read it into a module-level constant. See `ModelSpec.decode_dir_env`.
@@ -113,6 +113,10 @@ def air_inference_module(model):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["q4nx_inference"] = mod
     spec.loader.exec_module(mod)
+    if elf:
+        import xrt_elf
+
+        xrt_elf.install(mod)
     for name in {"FusedDecoder", model.decoder_class} - {""}:
         cls = getattr(mod, name, None)
         if isinstance(cls, type):
@@ -428,6 +432,11 @@ def _xrt_kv_sink(dec, spec):
     )
     host = slab.numpy()
     dec.kvc = slab.bo
+    # A full-ELF decoder bound its buffers into one run at construction, KV
+    # cache fifth, and does not rebind them per dispatch.
+    elf = getattr(dec, "_elfdec", None)
+    if elf is not None:
+        elf.run.set_arg(4, dec.kvc)
     if api == "prefiller":
         publish = lambda P: dec.kvc.sync(dec.TO)  # noqa: E731
     else:
@@ -1013,6 +1022,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         # One model's artifacts under another's name decode to fluent nonsense
         # rather than failing, so check before the decoder loads them.
         decode_build.check_stamp(spec)
+        if os.environ.get("DECODE_ELF") == "1":
+            decode_build.check_elf_stamp(spec)
 
     # On HSA the decode is ours too: mlir-air's decoder dispatches through
     # pyxrt, and HSA needs the instruction stream patched per token instead.
