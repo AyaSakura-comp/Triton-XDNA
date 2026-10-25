@@ -840,6 +840,59 @@ def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
     return os.path.dirname(lib_path)
 
 
+_XRT_RESIDENT_LIB = "libtriton_npu_xrt_resident.so"
+
+
+@functools.lru_cache(maxsize=1)
+def xrt_resident_lib_dir() -> "str | None":
+    """Build (once, cached) the NPU-resident memory registry; return its directory.
+
+    Compiles ``include/XrtResident/XrtResident.cpp`` into
+    ``libtriton_npu_xrt_resident.so``. Every ELF launcher links it, so the
+    registry inside -- and the device it opens -- is one per process; see
+    XrtResident.h for what that buys a launch. ``resident.py`` reaches the
+    same library through ctypes to allocate.
+
+    None on Windows, where launchers keep staging every argument.
+    """
+    if IS_WINDOWS:
+        return None
+    include_dir = os.path.join(Path(__file__).resolve().parent, "include")
+    src_dir = os.path.join(include_dir, "XrtResident")
+    xrt_dir = _get_xrt_path()
+    key_src = b"".join(
+        open(os.path.join(src_dir, f), "rb").read()
+        for f in ("XrtResident.h", "XrtResident.cpp")
+    )
+    key = hashlib.md5(key_src + f"_xrt_{xrt_dir}_xrtresident".encode()).hexdigest()
+    cache = get_cache_manager(key)
+    lib_path = cache.get_file(_XRT_RESIDENT_LIB)
+    if lib_path is not None:
+        return os.path.dirname(lib_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, _XRT_RESIDENT_LIB)
+        _run_compile(
+            [
+                "g++",
+                "-std=c++17",
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-pthread",
+                os.path.join(src_dir, "XrtResident.cpp"),
+                f"-I{os.path.join(xrt_dir, 'include')}",
+                f"-L{os.path.join(xrt_dir, 'lib')}",
+                f"-Wl,-rpath,{os.path.join(xrt_dir, 'lib')}",
+                "-lxrt_coreutil",
+                "-o",
+                out_path,
+            ]
+        )
+        with open(out_path, "rb") as f:
+            lib_path = cache.put(f.read(), _XRT_RESIDENT_LIB, binary=True)
+    return os.path.dirname(lib_path)
+
+
 def _find_msvc_cl() -> str:
     """Locate cl.exe for JIT compilation on Windows.
 
@@ -1904,8 +1957,18 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
-def _generate_elf_launcher(constants, signature, kernel_name):
-    """Generate C++ launcher code using XRT ELF APIs (for NPU2/AIE2P only)."""
+def _generate_elf_launcher(constants, signature, kernel_name, written=None, resident=False):
+    """Generate C++ launcher code using XRT ELF APIs (for NPU2/AIE2P only).
+
+    ``written`` is the set of argument indices the kernel stores to
+    (``codegen.written_pointer_args``); None, when that is unknown, keeps the
+    older rule that the last pointer argument is the only output.
+
+    With ``resident`` the launcher links the XrtResident registry: a pointer
+    argument inside NPU-resident memory (``resident.py``) is passed as its own
+    BO with only its bytes synced -- none at all for a static one -- and
+    nothing is copied. Other arguments are staged as before.
+    """
     arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = "".join([format_of(extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
@@ -1930,10 +1993,48 @@ def _generate_elf_launcher(constants, signature, kernel_name):
         None,
     )
 
-    # Build set_arg lines for kernel invocation
-    set_arg_lines = "\n    ".join(
-        f"run.set_arg({idx}, s.bo_{i});" for idx, (i, ty) in enumerate(ptr_args)
+    outputs = (
+        {last_ptr_idx} if written is None else {i for i, _ in ptr_args if i in written}
     )
+
+    # Per pointer argument: resolve it against the resident registry, or stage
+    # it. `bo{i}` is what the kernel gets either way.
+    def stage_in(i):
+        stage = (
+            f"if (s.cap{i} < size{i}) {{ s.bo_{i} = xrt::ext::bo{{s.device, (size_t)size{i}}}; s.cap{i} = size{i}; }} "
+            f"memcpy(s.bo_{i}.map<void *>(), arg{i}, size{i}); "
+            f"s.bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE, size{i}, 0); "
+            f"bo{i} = &s.bo_{i};"
+        )
+        if not resident:
+            return f"xrt::bo* bo{i}; {{ {stage} }}"
+        # A static allocation holds what the host does not write, so it was
+        # synced when marked and is not synced per launch.
+        return (
+            f"tnpu::Hit hit{i}; xrt::bo* bo{i}; "
+            f"if (tnpu::find(arg{i}, size{i}, hit{i})) {{ bo{i} = hit{i}.bo; "
+            f"if (!hit{i}.is_static) hit{i}.parent->sync(XCL_BO_SYNC_BO_TO_DEVICE, size{i}, hit{i}.offset); }} "
+            f"else {{ hit{i}.parent = nullptr; {stage} }}"
+        )
+
+    def stage_out(i):
+        copy_back = (
+            f"s.bo_{i}.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size{i}, 0); "
+            f"memcpy(arg{i}, s.bo_{i}.map<void *>(), size{i});"
+        )
+        if not resident:
+            return copy_back
+        return (
+            f"if (hit{i}.parent) hit{i}.parent->sync(XCL_BO_SYNC_BO_FROM_DEVICE, size{i}, hit{i}.offset); "
+            f"else {{ {copy_back} }}"
+        )
+
+    stage_in_lines = "\n    ".join(stage_in(i) for i, _ in ptr_args)
+    stage_out_lines = "\n    ".join(stage_out(i) for i, _ in ptr_args if i in outputs)
+    set_arg_lines = "\n    ".join(
+        f"run.set_arg({idx}, *bo{i});" for idx, (i, ty) in enumerate(ptr_args)
+    )
+    device_open = "tnpu::device()" if resident else "xrt::device(device_index)"
 
     return f"""
 #include <assert.h>
@@ -1957,6 +2058,7 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 #include "xrt/xrt_kernel.h"
 #include <xrt/experimental/xrt_elf.h>
 #include <xrt/experimental/xrt_ext.h>
+{'#include "XrtResident/XrtResident.h"' if resident else ''}
 
 static char elf_path[1024] = {{0}};
 static char elf_kernel_name[256] = {{0}};
@@ -2053,7 +2155,7 @@ static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.joi
             unsigned int device_index = 0;
             if (verbosity >= 1)
                 std::cout << "Opening device " << device_index << "..." << std::endl;
-            s.device = xrt::device(device_index);
+            s.device = {device_open};
         }}
 
         if (verbosity >= 1)
@@ -2072,15 +2174,12 @@ static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.joi
         s.ready = true;
     }}
 
-    // Grow-only buffers. Equal sizes are the expected case; a larger request
-    // reallocates rather than silently overflowing.
-    {' '.join(f'if (s.cap{i} < size{i}) {{{{ s.bo_{i} = xrt::ext::bo{{s.device, (size_t)size{i}}}; s.cap{i} = size{i}; }}}}' for i, ty in ptr_args)}
-
+    // Staging buffers are grow-only: equal sizes are the expected case, and a
+    // larger request reallocates rather than silently overflowing. Only the
+    // bytes an argument covers are copied and synced.
     if (verbosity >= 1)
         std::cout << "Writing data into buffer objects." << std::endl;
-    {' '.join(f'void *buf{i} = s.bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in ptr_args)}
-
-    {' '.join(f's.bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in ptr_args)}
+    {stage_in_lines}
 
     if (verbosity >= 1)
         std::cout << "Running Kernel." << std::endl;
@@ -2095,9 +2194,8 @@ static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.joi
 
     if (verbosity >= 1)
         std::cout << "Copying results." << std::endl;
-    // TODO: Assuming the last tensor is the only output tensor.
-    s.bo_{last_ptr_idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    memcpy(arg{last_ptr_idx}, buf{last_ptr_idx}, size{last_ptr_idx});
+    // The arguments the kernel stores to; the last one when that is unknown.
+    {stage_out_lines}
 
     if (verbosity >= 1)
         std::cout << "Launch finished." << std::endl;
@@ -2389,6 +2487,9 @@ _last_dispatched_module = None
 # alone builds 18 in one process, and matmul_bf16_* builds 27.
 _live_sessions = collections.OrderedDict()
 
+# compile_module's launch: (IR id, grid, ...) -> (IR, module cache key).
+_dispatch_keys = {}
+
 # How many may hold one at once. Well under any device's limit, and above the
 # working set of a model that cycles through a handful of kernels per layer,
 # which is the case the session exists for.
@@ -2511,8 +2612,12 @@ def compile_module(
     actual_sizes=None,
     on_cache_resolved=None,
     link_profile="xrt",
+    resident_lib_dir=None,
 ):
     """Lower a kernel and JIT-compile its host launcher shared object.
+
+    ``resident_lib_dir`` is where ``libtriton_npu_xrt_resident.so`` lives, for
+    an ELF launcher generated with ``resident=True``; it is linked when given.
 
     ``link_profile`` selects the runtime the generated launcher links against:
 
@@ -2575,6 +2680,25 @@ def compile_module(
         asm_src = cu_function
         kernel_name = kernel_metadata[6]  # see pack_metadata in compiler.py
 
+        # Steady state: this kernel, at this grid, has dispatched before. The
+        # key below is a regex over the IR plus an md5 of it -- ~0.1 ms per
+        # launch for a matmul -- and depends only on what is in `fast_key`, so
+        # remember it. The IR object is kept alongside, both so the id stays
+        # unique and so a recompiled kernel at a reused address misses.
+        fast_key = (
+            id(asm_src), gridX, gridY, gridZ, kernel_name, autotune_time,
+            npu_config.transform_tiling_script, npu_config.bf16_emulation,
+        )
+        known = _dispatch_keys.get(fast_key)
+        if known is not None and known[0] is asm_src:
+            mod = _global_module_cache.get(known[1])
+            if mod is not None:
+                _last_dispatched_module = mod
+                return _launch_with_session(
+                    known[1], mod, gridX, gridY, gridZ, kernel_metadata,
+                    launch_metadata, launch_enter_hook, launch_exit_hook, *args,
+                )
+
         # Auto-generate a matmul tiling schedule when the IR is a plain matmul
         # and no user script is supplied. f32 matmul additionally turns on
         # bf16 emulation (no native f32 MAC on AIE). The emulation decision is
@@ -2600,6 +2724,7 @@ def compile_module(
             f"_{autotune_time}_{output_format}_{link_profile}"
             f"_{effective_bf16}_{user_script or ''}".encode()
         ).hexdigest()
+        _dispatch_keys[fast_key] = (asm_src, input_key)
 
         if input_key in _global_module_cache:
             mod = _global_module_cache[input_key]
@@ -2659,6 +2784,8 @@ def compile_module(
             # and the "process-global" HsaRuntime singleton would be two
             # runtimes that share neither queue nor shared regions.
             + f"_hsart_{hsa_rt_dir or ''}"
+            # Same reasoning for the resident registry: one copy per process.
+            + f"_resident_{resident_lib_dir or ''}"
         )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
@@ -2746,6 +2873,12 @@ def compile_module(
                             "-lrt",
                             "-lstdc++",
                         ]
+                        if resident_lib_dir:
+                            compile_flags += [
+                                f"-L{resident_lib_dir}",
+                                f"-Wl,-rpath,{resident_lib_dir}",
+                                "-ltriton_npu_xrt_resident",
+                            ]
                     if output_format != "elf":
                         # xclbin mode previously needed test_utils for loading
                         # instruction binary, but that has been inlined.
@@ -2867,6 +3000,7 @@ class NPULauncher(object):
         HSA/ROCR); it is bound by ``NPUDriver`` when it constructs the launcher.
         """
         constants, signature = extract_signature_and_constants(src)
+        resident_lib_dir = None
         if runtime == "hsa":
             # HSA consumes PDI + insts and links ROCR. Import lazily so the
             # (large) HSA codegen module is only loaded when the HSA path is used.
@@ -2886,8 +3020,13 @@ class NPULauncher(object):
             # runtime rather than the (possibly different) global config.
             self.output_format = _get_output_format(runtime=runtime)
             if self.output_format == "elf":
+                resident_lib_dir = xrt_resident_lib_dir()
                 launcher_src = _generate_elf_launcher(
-                    constants, signature, self.kernel_placeholder_name
+                    constants,
+                    signature,
+                    self.kernel_placeholder_name,
+                    written=written_pointer_args(src),
+                    resident=resident_lib_dir is not None,
                 )
             else:
                 launcher_src = _generate_launcher(
@@ -2895,9 +3034,13 @@ class NPULauncher(object):
                 )
             link_profile = "xrt"
 
-        self._finalize(src, launcher_src, link_profile=link_profile)
+        self._finalize(
+            src, launcher_src, link_profile=link_profile, resident_lib_dir=resident_lib_dir
+        )
 
-    def _finalize(self, src, launcher_src: str, link_profile: str = "xrt") -> None:
+    def _finalize(
+        self, src, launcher_src: str, link_profile: str = "xrt", resident_lib_dir=None
+    ) -> None:
         """Extract padding sizes, wire the cache-dir callback, and JIT-compile.
 
         Uses ``self.output_format`` (set by ``__init__``). Shared by the XRT and
@@ -2918,6 +3061,7 @@ class NPULauncher(object):
             actual_sizes=actual_sizes,
             on_cache_resolved=_on_cache_resolved,
             link_profile=link_profile,
+            resident_lib_dir=resident_lib_dir,
         )
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
@@ -3000,15 +3144,27 @@ class NPUUtils(object):
     # Since we cannot easy pass function pointers around, we pass along the
     # assembly source code so that compile_module above can recompile the
     # module every time.
+    #
+    # The module handed back is a placeholder, but it must not be None:
+    # CompiledKernel._init_handles treats None as "not loaded yet" and builds
+    # the launcher again, and it is called on every launch whenever a launch
+    # hook is installed -- which, with knobs' HookChain, is always. That was
+    # an NPULauncher construction (an ast walk of the kernel source among
+    # other things), ~0.9 ms, per dispatch.
     @staticmethod
     def load_binary(name, kernel_asm, shared, device):
         return (
-            None,  # module
+            name,  # module
             kernel_asm,  # function
             None,  # n_regs
             None,  # n_spills
             sys.maxsize,  # n_max_threads
         )
+
+
+    @staticmethod
+    def unload_module(module):
+        pass  # load_binary loaded nothing
 
 
 class NPUDriver(DriverBase):

@@ -245,6 +245,32 @@ whole zero-copy dispatch costs under 1 ms — so allocating per iteration, as
 torch code does, is cheap after the first. `shared.empty_cache()` and
 `shared.set_cache_enabled(False)` are there for when it should not be.
 
+#### Resident tensors (XRT)
+
+Under XRT an ordinary launch stages every tensor argument: it is copied into a
+buffer object and synced before the run, and the output is synced and copied
+back after. A tensor from `triton.backends.amd_triton_npu.resident` is a CPU
+tensor whose pages already are a BO, so the ELF launcher passes it as it is —
+no copy, and only the bytes the argument covers are synced (a view such as
+`x[:rows]` syncs `rows` rows). A *static* one, for weights, is synced once when
+it is marked and never per launch:
+
+```python
+from triton.backends.amd_triton_npu import resident
+
+w = resident.to_npu(weight, static=True)      # written once
+x = resident.empty((4096, K), dtype=torch.int8)
+y = resident.empty((4096, N), dtype=torch.int32)
+x[:rows].copy_(activations)
+matmul[grid](x, w, y, ...)                     # nothing copied
+use(y[:rows])                                  # the BO's own pages
+resident.update(w, new_weight)                 # how a static tensor is rewritten
+```
+
+Ordinary and resident tensors mix freely in one launch. Arguments are copied
+back only if the kernel stores to them (`codegen.written_pointer_args`), not
+by position. See `examples/resident_tensors`.
+
 ## Windows Support
 
 Triton-XDNA runs natively on Windows — no WSL, no Linux VM. The whole flow,
