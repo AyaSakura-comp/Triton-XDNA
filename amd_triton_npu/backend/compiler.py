@@ -24,7 +24,11 @@ IS_WINDOWS = sys.platform == "win32"
 
 def _get_amd_triton_npu_opt_path() -> str:
     binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
-    path = Path(__file__).resolve().parent.parent.parent / "triton_shared" / binary_name
+    # Next to the triton package, not to this file: the backend directory may
+    # be a symlink into a source checkout.
+    import triton
+
+    path = Path(triton.__file__).resolve().parent / "triton_shared" / binary_name
     if not os.path.isdir(path.parent):
         raise RuntimeError(f"Could not find triton-shared binaries at {path}")
     return path
