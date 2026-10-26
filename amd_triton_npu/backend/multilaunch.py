@@ -30,6 +30,7 @@ from .driver import (
     _detect_matmul,
     _matmul_transform_params,
     _aircc_compile,
+    _air_project_lock,
     aircc_device,
     _get_output_format,
     _get_cached_aircc_artifacts,
@@ -292,20 +293,20 @@ module {{
             return cached["bin_path"], cached["insts_path"]
 
         air_proj = self.air_project_path
-        os.makedirs(air_proj, exist_ok=True)
-        air_mlir_path = os.path.join(air_proj, f"{self.name}_multilaunch.mlir")
-        with open(air_mlir_path, "w") as f:
-            f.write(combined)
+        with _air_project_lock(air_proj):
+            air_mlir_path = os.path.join(air_proj, f"{self.name}_multilaunch.mlir")
+            with open(air_mlir_path, "w") as f:
+                f.write(combined)
 
-        artifacts = _aircc_compile(
-            air_mlir_path,
-            output_format,
-            npu_version,
-            air_proj,
-            bf16_emulation=self._bf16_emulation(),
-        )
-        # Cache the format-specific artifacts and return the cached paths.
-        cached = _put_aircc_artifacts(cache, artifacts, output_format)
+            artifacts = _aircc_compile(
+                air_mlir_path,
+                output_format,
+                npu_version,
+                air_proj,
+                bf16_emulation=self._bf16_emulation(),
+            )
+            # Cache the format-specific artifacts and return the cached paths.
+            cached = _put_aircc_artifacts(cache, artifacts, output_format)
         if output_format == "elf":
             return cached["elf_path"], artifacts["elf_kernel_name"]
         return cached["bin_path"], cached["insts_path"]

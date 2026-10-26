@@ -3,6 +3,7 @@
 
 import collections
 import functools
+import contextlib
 import hashlib
 import json
 import logging
@@ -2289,6 +2290,31 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
+@contextlib.contextmanager
+def _air_project_lock(path):
+    """Serialize builds that share an AIR project directory.
+
+    A build writes its intermediates (asm_src.mlir, asm_air_output.mlir and
+    aircc's work files) into the project directory, then caches what it finds
+    there. Two processes building at once in the same directory -- the default
+    ``./air_project`` of two runs from one working directory -- mix each
+    other's files, and the mixed binary is cached and dispatched without any
+    error: silently wrong results that persist across runs.
+    """
+    os.makedirs(path, exist_ok=True)
+    if IS_WINDOWS:
+        yield
+        return
+    import fcntl
+
+    with open(os.path.join(path, ".build.lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 _FULL_COLUMNS = {"npu1": 4, "npu2": 8}
 
 
@@ -2700,9 +2726,17 @@ def compile_module(
         # remember it. The IR object is kept alongside, both so the id stays
         # unique and so a recompiled kernel at a reused address misses.
         fast_key = (
-            id(asm_src), gridX, gridY, gridZ, kernel_name, autotune_time,
-            npu_config.transform_tiling_script, npu_config.bf16_emulation,
+            id(asm_src),
+            gridX,
+            gridY,
+            gridZ,
+            kernel_name,
+            autotune_time,
+            npu_config.transform_tiling_script,
+            npu_config.bf16_emulation,
             npu_config.device_columns,
+            npu_config.runtime_loop_tiling,
+            npu_config.aircc_extra_args,
         )
         known = _dispatch_keys.get(fast_key)
         if known is not None and known[0] is asm_src:
@@ -2737,7 +2771,8 @@ def compile_module(
         input_key = hashlib.md5(
             asm_src + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
             f"_{autotune_time}_{output_format}_{link_profile}"
-            f"_{effective_bf16}_{user_script or ''}_{npu_config.device_columns}".encode()
+            f"_{effective_bf16}_{user_script or ''}_{npu_config.device_columns}"
+            f"_{npu_config.runtime_loop_tiling}_{npu_config.aircc_extra_args}".encode()
         ).hexdigest()
         _dispatch_keys[fast_key] = (asm_src, input_key)
 
@@ -2760,197 +2795,209 @@ def compile_module(
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
         air_proj_path = npu_config.air_project_path
-        os.makedirs(air_proj_path, exist_ok=True)
-        Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
-        air_output = _ttshared_to_air(
-            asm_src,
-            gridX,
-            gridY,
-            gridZ,
-            actual_sizes=actual_sizes,
-            matmul_info=matmul_params,
-        )
-        with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
-            f.write(str(air_output))
+        # Held until the build is cached: see _air_project_lock.
+        with _air_project_lock(air_proj_path):
+            os.makedirs(air_proj_path, exist_ok=True)
+            Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
+            air_output = _ttshared_to_air(
+                asm_src,
+                gridX,
+                gridY,
+                gridZ,
+                actual_sizes=actual_sizes,
+                matmul_info=matmul_params,
+            )
+            with open(
+                Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w"
+            ) as f:
+                f.write(str(air_output))
 
-        npu_version = detect_npu_version(link_profile)
-        key_data = (
-            str(air_output)
-            # This cache holds the compiled launcher, and the AIR IR above does
-            # not determine it: the launcher is generated from the kernel's
-            # signature and constants, and a constexpr that folds to a value an
-            # existing one already had lowers to byte-identical IR while
-            # changing the launcher's arity. Without this the stale .so is
-            # reused and called with the wrong number of arguments -- surfacing
-            # as "function takes exactly N arguments (N+1 given)" from a module
-            # the caller never built, only for those with a warm cache, so it
-            # reproduces on upgrade and never in CI.
-            + f"_launcher_{hashlib.md5(launcher_src.encode()).hexdigest()}"
-            + f"_timing_{autotune_time}"
-            + f"_format_{output_format}"
-            + f"_link_{link_profile}"
-            + f"_npu_{aircc_device(npu_version)}"
-            + f"_bf16emu_{effective_bf16}"
-            # Which build of the shared HSA runtime this launcher links. That
-            # directory is content-addressed, so naming it here rebuilds the
-            # launcher whenever the runtime changes -- and a launcher must not
-            # outlive the build it was linked against: its rpath would load a
-            # second copy of the library beside the one everything else uses,
-            # and the "process-global" HsaRuntime singleton would be two
-            # runtimes that share neither queue nor shared regions.
-            + f"_hsart_{hsa_rt_dir or ''}"
-            # Same reasoning for the resident registry: one copy per process.
-            + f"_resident_{resident_lib_dir or ''}"
-        )
-        key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
+            npu_version = detect_npu_version(link_profile)
+            key_data = (
+                str(air_output)
+                # This cache holds the compiled launcher, and the AIR IR above does
+                # not determine it: the launcher is generated from the kernel's
+                # signature and constants, and a constexpr that folds to a value an
+                # existing one already had lowers to byte-identical IR while
+                # changing the launcher's arity. Without this the stale .so is
+                # reused and called with the wrong number of arguments -- surfacing
+                # as "function takes exactly N arguments (N+1 given)" from a module
+                # the caller never built, only for those with a warm cache, so it
+                # reproduces on upgrade and never in CI.
+                + f"_launcher_{hashlib.md5(launcher_src.encode()).hexdigest()}"
+                + f"_timing_{autotune_time}"
+                + f"_format_{output_format}"
+                + f"_link_{link_profile}"
+                + f"_npu_{aircc_device(npu_version)}"
+                + f"_rlt_{npu_config.runtime_loop_tiling}_aircc_{' '.join(npu_config.aircc_extra_args)}"
+                + f"_bf16emu_{effective_bf16}"
+                # Which build of the shared HSA runtime this launcher links. That
+                # directory is content-addressed, so naming it here rebuilds the
+                # launcher whenever the runtime changes -- and a launcher must not
+                # outlive the build it was linked against: its rpath would load a
+                # second copy of the library beside the one everything else uses,
+                # and the "process-global" HsaRuntime singleton would be two
+                # runtimes that share neither queue nor shared regions.
+                + f"_hsart_{hsa_rt_dir or ''}"
+                # Same reasoning for the resident registry: one copy per process.
+                + f"_resident_{resident_lib_dir or ''}"
+            )
+            key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
-        cache = get_cache_manager(key)
-        if on_cache_resolved is not None:
-            on_cache_resolved(cache.cache_dir)
-        name = "__npu_dispatch"
-        filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
-        cache_path = cache.get_file(filename)
-        cached_artifacts = _get_cached_aircc_artifacts(cache, output_format)
-        if cached_artifacts is not None:
-            if output_format == "elf":
-                cache_elf_path = cached_artifacts["elf_path"]
-                cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
-            else:
-                cache_bin_path = cached_artifacts["bin_path"]
-                cache_insts_path = cached_artifacts["insts_path"]
-
-        if cache_path is None:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                launcher_src_path = os.path.join(tmpdir, "main.cxx")
-                if IS_WINDOWS:
-                    so_path = os.path.join(tmpdir, "xrt_dispatch.pyd")
-                else:
-                    so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
-                Path(launcher_src_path).write_text(src)
-                # Compile the launcher shared library.
-                if IS_WINDOWS:
-                    cl_path = _find_msvc_cl()
-                    msvc_env = _get_msvc_env(cl_path)
-                    compile_flags = [
-                        cl_path,
-                        "/std:c++latest",
-                        "/MD",
-                        "/Zc:__cplusplus",
-                        "/EHsc",
-                        "/LD",
-                        f"/Fe:{so_path}",
-                        launcher_src_path,
-                        f"/I{py_include_dir}",
-                        f"/I{include_dir}",
-                        f"/I{os.path.join(xrt_dir, 'include')}",
-                        f"/link",
-                        f"/LIBPATH:{py_lib_dir}",
-                        f"/LIBPATH:{os.path.join(xrt_dir, 'lib')}",
-                        f"{py_lib}",
-                        "xrt_coreutil.lib",
-                    ]
-                    if output_format != "elf":
-                        # xclbin mode previously needed test_utils for loading
-                        # instruction binary, but that has been inlined.
-                        pass
-                else:
-                    msvc_env = None
-                    compile_flags = [
-                        "g++",
-                        "-std=c++23",
-                        launcher_src_path,
-                        f"-I{py_include_dir}",
-                        f"-I{include_dir}",
-                        f"-L{py_lib_dir}",
-                        "-shared",
-                        f"-l{py_lib}",
-                        "-fPIC",
-                        "-Wall",
-                    ]
-                    if link_profile == "hsa":
-                        # Link the shared HSA runtime (libtriton_npu_hsa.so),
-                        # which in turn links libhsa-runtime64. The launcher needs
-                        # no ROCR headers -- only the C ABI in include/HsaRuntime
-                        # (covered by -I{include_dir} above). rpath keeps both
-                        # .so's loadable without LD_LIBRARY_PATH.
-                        compile_flags += [
-                            f"-L{hsa_rt_dir}",
-                            f"-Wl,-rpath,{hsa_rt_dir}",
-                            "-ltriton_npu_hsa",
-                            "-lstdc++",
-                        ]
-                    else:
-                        compile_flags += [
-                            f"-I{os.path.join(xrt_dir, 'include')}",
-                            f"-L{os.path.join(xrt_dir, 'lib')}",
-                            "-luuid",
-                            "-lxrt_coreutil",
-                            "-lrt",
-                            "-lstdc++",
-                        ]
-                        if resident_lib_dir:
-                            compile_flags += [
-                                f"-L{resident_lib_dir}",
-                                f"-Wl,-rpath,{resident_lib_dir}",
-                                "-ltriton_npu_xrt_resident",
-                            ]
-                    if output_format != "elf":
-                        # xclbin mode previously needed test_utils for loading
-                        # instruction binary, but that has been inlined.
-                        pass
-                    compile_flags += ["-o", so_path]
-                _run_compile(compile_flags, env=msvc_env)
-
-                ###### Compile to binary (ELF or xclbin + insts)
-                air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
-                artifacts = _aircc_compile(
-                    air_mlir_path,
-                    output_format,
-                    npu_version,
-                    air_proj_path,
-                    bf16_emulation=effective_bf16,
-                )
-
-                # Cache format-specific artifacts first, then the .so last.
-                # This avoids partial cache entries if aircc or kernel name
-                # extraction fails -- the .so is the gate for cache hits.
-                cached_artifacts = _put_aircc_artifacts(cache, artifacts, output_format)
+            cache = get_cache_manager(key)
+            if on_cache_resolved is not None:
+                on_cache_resolved(cache.cache_dir)
+            name = "__npu_dispatch"
+            filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
+            cache_path = cache.get_file(filename)
+            cached_artifacts = _get_cached_aircc_artifacts(cache, output_format)
+            if cached_artifacts is not None:
                 if output_format == "elf":
                     cache_elf_path = cached_artifacts["elf_path"]
                     cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
                 else:
                     cache_bin_path = cached_artifacts["bin_path"]
                     cache_insts_path = cached_artifacts["insts_path"]
-                with open(so_path, "rb") as f:
-                    cache_path = cache.put(f.read(), filename, binary=True)
 
-                # Check for compile-only mode
+            if cache_path is None:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    launcher_src_path = os.path.join(tmpdir, "main.cxx")
+                    if IS_WINDOWS:
+                        so_path = os.path.join(tmpdir, "xrt_dispatch.pyd")
+                    else:
+                        so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
+                    Path(launcher_src_path).write_text(src)
+                    # Compile the launcher shared library.
+                    if IS_WINDOWS:
+                        cl_path = _find_msvc_cl()
+                        msvc_env = _get_msvc_env(cl_path)
+                        compile_flags = [
+                            cl_path,
+                            "/std:c++latest",
+                            "/MD",
+                            "/Zc:__cplusplus",
+                            "/EHsc",
+                            "/LD",
+                            f"/Fe:{so_path}",
+                            launcher_src_path,
+                            f"/I{py_include_dir}",
+                            f"/I{include_dir}",
+                            f"/I{os.path.join(xrt_dir, 'include')}",
+                            f"/link",
+                            f"/LIBPATH:{py_lib_dir}",
+                            f"/LIBPATH:{os.path.join(xrt_dir, 'lib')}",
+                            f"{py_lib}",
+                            "xrt_coreutil.lib",
+                        ]
+                        if output_format != "elf":
+                            # xclbin mode previously needed test_utils for loading
+                            # instruction binary, but that has been inlined.
+                            pass
+                    else:
+                        msvc_env = None
+                        compile_flags = [
+                            "g++",
+                            "-std=c++23",
+                            launcher_src_path,
+                            f"-I{py_include_dir}",
+                            f"-I{include_dir}",
+                            f"-L{py_lib_dir}",
+                            "-shared",
+                            f"-l{py_lib}",
+                            "-fPIC",
+                            "-Wall",
+                        ]
+                        if link_profile == "hsa":
+                            # Link the shared HSA runtime (libtriton_npu_hsa.so),
+                            # which in turn links libhsa-runtime64. The launcher needs
+                            # no ROCR headers -- only the C ABI in include/HsaRuntime
+                            # (covered by -I{include_dir} above). rpath keeps both
+                            # .so's loadable without LD_LIBRARY_PATH.
+                            compile_flags += [
+                                f"-L{hsa_rt_dir}",
+                                f"-Wl,-rpath,{hsa_rt_dir}",
+                                "-ltriton_npu_hsa",
+                                "-lstdc++",
+                            ]
+                        else:
+                            compile_flags += [
+                                f"-I{os.path.join(xrt_dir, 'include')}",
+                                f"-L{os.path.join(xrt_dir, 'lib')}",
+                                "-luuid",
+                                "-lxrt_coreutil",
+                                "-lrt",
+                                "-lstdc++",
+                            ]
+                            if resident_lib_dir:
+                                compile_flags += [
+                                    f"-L{resident_lib_dir}",
+                                    f"-Wl,-rpath,{resident_lib_dir}",
+                                    "-ltriton_npu_xrt_resident",
+                                ]
+                        if output_format != "elf":
+                            # xclbin mode previously needed test_utils for loading
+                            # instruction binary, but that has been inlined.
+                            pass
+                        compile_flags += ["-o", so_path]
+                    _run_compile(compile_flags, env=msvc_env)
+
+                    ###### Compile to binary (ELF or xclbin + insts)
+                    air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
+                    rlt = npu_config.runtime_loop_tiling
+                    artifacts = _aircc_compile(
+                        air_mlir_path,
+                        output_format,
+                        npu_version,
+                        air_proj_path,
+                        bf16_emulation=effective_bf16,
+                        extra_args=list(npu_config.aircc_extra_args) or None,
+                        **({} if rlt is None else {"runtime_loop_tiling_sizes": rlt}),
+                    )
+
+                    # Cache format-specific artifacts first, then the .so last.
+                    # This avoids partial cache entries if aircc or kernel name
+                    # extraction fails -- the .so is the gate for cache hits.
+                    cached_artifacts = _put_aircc_artifacts(
+                        cache, artifacts, output_format
+                    )
+                    if output_format == "elf":
+                        cache_elf_path = cached_artifacts["elf_path"]
+                        cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
+                    else:
+                        cache_bin_path = cached_artifacts["bin_path"]
+                        cache_insts_path = cached_artifacts["insts_path"]
+                    with open(so_path, "rb") as f:
+                        cache_path = cache.put(f.read(), filename, binary=True)
+
+                    # Check for compile-only mode
+                    if npu_config.compile_only:
+                        logger.debug(
+                            "Compile-only mode: binaries cached at %s", cache_path
+                        )
+                        if output_format == "elf":
+                            logger.debug("  elf: %s", cache_elf_path)
+                        else:
+                            logger.debug("  %s: %s", output_format, cache_bin_path)
+                            logger.debug("  insts: %s", cache_insts_path)
+                        return None
+            else:
+                logger.debug(
+                    "got cache path: %s compilation is therefore skipped "
+                    "(delete cache path to force recompile).",
+                    cache_path,
+                )
+
+                # Check for compile-only mode (cache hit)
                 if npu_config.compile_only:
-                    logger.debug("Compile-only mode: binaries cached at %s", cache_path)
+                    logger.debug(
+                        "Compile-only mode (cache hit): binaries at %s", cache_path
+                    )
                     if output_format == "elf":
                         logger.debug("  elf: %s", cache_elf_path)
                     else:
                         logger.debug("  %s: %s", output_format, cache_bin_path)
                         logger.debug("  insts: %s", cache_insts_path)
                     return None
-        else:
-            logger.debug(
-                "got cache path: %s compilation is therefore skipped "
-                "(delete cache path to force recompile).",
-                cache_path,
-            )
-
-            # Check for compile-only mode (cache hit)
-            if npu_config.compile_only:
-                logger.debug(
-                    "Compile-only mode (cache hit): binaries at %s", cache_path
-                )
-                if output_format == "elf":
-                    logger.debug("  elf: %s", cache_elf_path)
-                else:
-                    logger.debug("  %s: %s", output_format, cache_bin_path)
-                    logger.debug("  insts: %s", cache_insts_path)
-                return None
 
         # Load and launch the compiled kernel.
         spec = importlib.util.spec_from_file_location(name, cache_path)

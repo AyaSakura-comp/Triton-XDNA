@@ -59,6 +59,8 @@ class _NPUConfig:
         self._bf16_emulation = MISSING
         self._output_format = MISSING
         self._device_columns = MISSING
+        self._runtime_loop_tiling = MISSING
+        self._aircc_extra_args = MISSING
         self._air_project_path = MISSING
         self._debug = MISSING
         self._target = MISSING
@@ -168,8 +170,50 @@ class _NPUConfig:
     @device_columns.setter
     def device_columns(self, value):
         if value is not None and int(value) < 1:
-            raise ValueError(f"device_columns must be a positive int or None; got {value!r}")
+            raise ValueError(
+                f"device_columns must be a positive int or None; got {value!r}"
+            )
         self._device_columns = None if value is None else int(value)
+
+    # ---- runtime_loop_tiling ----
+
+    @property
+    def runtime_loop_tiling(self):
+        """aircc's ``--air-runtime-loop-tiling-sizes`` for kernels the compiler path builds.
+
+        ``None`` keeps the backend's default (4, 4); ``()`` leaves the flag off (aircc's
+        own default since mlir-air #1470); a tuple of ints passes those.
+
+        Env var fallback: ``AMD_TRITON_NPU_RUNTIME_LOOP_TILING`` ("4,4", or "" for off).
+        """
+        if self._runtime_loop_tiling is not MISSING:
+            return self._runtime_loop_tiling
+        v = os.getenv("AMD_TRITON_NPU_RUNTIME_LOOP_TILING")
+        if v is None:
+            return None
+        return tuple(int(x) for x in v.replace(" ", "").split(",") if x)
+
+    @runtime_loop_tiling.setter
+    def runtime_loop_tiling(self, value):
+        self._runtime_loop_tiling = (
+            None if value is None else tuple(int(x) for x in value)
+        )
+
+    # ---- aircc_extra_args ----
+
+    @property
+    def aircc_extra_args(self):
+        """Further aircc flags for kernels the compiler path builds, e.g. ("--use-lock-race-condition-fix",).
+
+        Env var fallback: ``AMD_TRITON_NPU_AIRCC_ARGS`` (whitespace separated).
+        """
+        if self._aircc_extra_args is not MISSING:
+            return self._aircc_extra_args
+        return tuple(os.getenv("AMD_TRITON_NPU_AIRCC_ARGS", "").split())
+
+    @aircc_extra_args.setter
+    def aircc_extra_args(self, value):
+        self._aircc_extra_args = tuple(value or ())
 
     # ---- air_project_path ----
 
@@ -379,6 +423,8 @@ class _NPUConfig:
         self._bf16_emulation = MISSING
         self._output_format = MISSING
         self._device_columns = MISSING
+        self._runtime_loop_tiling = MISSING
+        self._aircc_extra_args = MISSING
         self._air_project_path = MISSING
         self._debug = MISSING
         self._target = MISSING
@@ -414,6 +460,8 @@ def set_config(**kwargs):
         "bf16_emulation",
         "output_format",
         "device_columns",
+        "runtime_loop_tiling",
+        "aircc_extra_args",
         "air_project_path",
         "target",
         "runtime",
