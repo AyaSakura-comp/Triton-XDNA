@@ -418,15 +418,19 @@ _SHARED = {}  # merged ELF path -> (elf, hw_context)
 def share_context(ops):
     """Run ``ops`` as the kernels of one full ELF: one hardware context for all of them.
 
-    Separately each op holds a context, and a launch after another op's launch pays a
+    Separately each design holds a context, and a launch after another design's pays a
     context switch (~2.3 ms measured for two of these designs). Merged, every launch
     rewrites its own configuration instead (~0.3-0.5 ms), whatever ran before: the way
-    to run the layers of a model one after the other. The ops keep their buffers.
+    to run the layers of a model one after the other. Ops of one design share a kernel;
+    with a single design there is nothing to merge (its context never switches). The
+    ops keep their buffers. Returns the merged ELF's path, or None.
     """
     ops = list(ops)
     if any(op.design_mlir is None for op in ops):
         raise Conv3x3ConfigError("share_context needs ops built as full ELFs")
-    mlirs = [op.design_mlir for op in ops]
+    mlirs = sorted({op.design_mlir for op in ops})
+    if len(mlirs) < 2:
+        return None
     sources = [open(m, "rb").read() for m in mlirs]
     key = _key(DESIGN_SOURCE.read_bytes(), _toolchain(), *sources)
     out = os.path.join(_cache_dir(), f"model_{key}")
@@ -452,8 +456,11 @@ def share_context(ops):
             elf = pyxrt.elf(elf_path)
             _SHARED[elf_path] = (elf, pyxrt.hw_context(_device(), elf))
         ctx = _SHARED[elf_path][1]
-        for k, op in enumerate(ops):
-            op.prog = _SharedProgram(ctx, f"conv{k}:sequence")
+        kernels = {
+            m: _SharedProgram(ctx, f"conv{k}:sequence") for k, m in enumerate(mlirs)
+        }
+        for op in ops:
+            op.prog = kernels[op.design_mlir]
             # its own context goes once no op uses it
             _PROGRAMS.pop(op.program_path, None)
     return elf_path
