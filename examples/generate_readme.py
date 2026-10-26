@@ -182,6 +182,18 @@ EXAMPLES = [
     },
     {
         "kind": "feature",
+        "name": "3x3 Convolution on the Whole Array (tl.extra.npu.conv3x3)",
+        "path": "conv3x3_cascade",
+        "datatypes": "i8 -> i8 / u8 (ReLU)",
+        "description": (
+            "An op, not a jit kernel: weights stay in every core for the whole "
+            "image, the input channels are split over two cores whose partial "
+            "sums meet over the AIE cascade. 52.6 TOPS (86% of int8 peak) on "
+            "Strix, bit-exact."
+        ),
+    },
+    {
+        "kind": "feature",
         "name": "Zero-Copy iGPU/NPU Buffers",
         "path": "zero_copy",
         "datatypes": "f32",
