@@ -58,6 +58,12 @@ EXAMPLES = [
     },
     {
         "category": "Matrix",
+        "name": "Matrix Multiplication (INT8 W8A8, K Loop, Resident Weights)",
+        "path": "matmul_i8_k_loop",
+        "datatypes": "i8 -> i32",
+    },
+    {
+        "category": "Matrix",
         "name": "Matrix Multiplication (BF16, Elementwise Epilogue)",
         "path": "matmul_bf16_epilogue",
         "datatypes": "bf16",
