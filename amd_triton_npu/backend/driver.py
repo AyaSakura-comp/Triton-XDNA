@@ -2289,6 +2289,17 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
+_FULL_COLUMNS = {"npu1": 4, "npu2": 8}
+
+
+def aircc_device(npu_version):
+    """aircc's ``--device``: the whole array, or ``npu_config.device_columns`` of it."""
+    cols = npu_config.device_columns
+    if not cols or cols >= _FULL_COLUMNS.get(npu_version, cols + 1):
+        return npu_version
+    return f"{npu_version}_{cols}col"
+
+
 def _aircc_compile(
     air_mlir_path,
     output_format,
@@ -2382,7 +2393,7 @@ def _aircc_compile(
         aircc_cmd = [
             aircc_bin,
             "--device",
-            npu_version,
+            aircc_device(npu_version),
             "--no-xchesscc",
             "--no-xbridge",
             "--output-format",
@@ -2401,7 +2412,7 @@ def _aircc_compile(
         aircc_cmd = [
             aircc_bin,
             "--device",
-            npu_version,
+            aircc_device(npu_version),
             "--no-xchesscc",
             "--no-xbridge",
             "--output-format",
@@ -2419,7 +2430,7 @@ def _aircc_compile(
         aircc_cmd = [
             aircc_bin,
             "--device",
-            npu_version,
+            aircc_device(npu_version),
             "--no-xchesscc",
             "--no-xbridge",
             "--output-format",
@@ -2691,6 +2702,7 @@ def compile_module(
         fast_key = (
             id(asm_src), gridX, gridY, gridZ, kernel_name, autotune_time,
             npu_config.transform_tiling_script, npu_config.bf16_emulation,
+            npu_config.device_columns,
         )
         known = _dispatch_keys.get(fast_key)
         if known is not None and known[0] is asm_src:
@@ -2725,7 +2737,7 @@ def compile_module(
         input_key = hashlib.md5(
             asm_src + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
             f"_{autotune_time}_{output_format}_{link_profile}"
-            f"_{effective_bf16}_{user_script or ''}".encode()
+            f"_{effective_bf16}_{user_script or ''}_{npu_config.device_columns}".encode()
         ).hexdigest()
         _dispatch_keys[fast_key] = (asm_src, input_key)
 
@@ -2777,7 +2789,7 @@ def compile_module(
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
             + f"_link_{link_profile}"
-            + f"_npu_{npu_version}"
+            + f"_npu_{aircc_device(npu_version)}"
             + f"_bf16emu_{effective_bf16}"
             # Which build of the shared HSA runtime this launcher links. That
             # directory is content-addressed, so naming it here rebuilds the

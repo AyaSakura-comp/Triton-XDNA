@@ -30,6 +30,7 @@ from .driver import (
     _detect_matmul,
     _matmul_transform_params,
     _aircc_compile,
+    aircc_device,
     _get_output_format,
     _get_cached_aircc_artifacts,
     _put_aircc_artifacts,
@@ -260,7 +261,7 @@ module {{
         key_data = (
             text
             + f"_format_{output_format}"
-            + f"_npu_{npu_version}"
+            + f"_npu_{aircc_device(npu_version)}"
             + f"_bf16emu_{self._bf16_emulation()}"
         )
         return hashlib.md5(key_data.encode("utf-8")).hexdigest()

@@ -58,6 +58,7 @@ class _NPUConfig:
         self._transform_tiling_script = MISSING
         self._bf16_emulation = MISSING
         self._output_format = MISSING
+        self._device_columns = MISSING
         self._air_project_path = MISSING
         self._debug = MISSING
         self._target = MISSING
@@ -145,6 +146,30 @@ class _NPUConfig:
                 f"output_format must be 'elf', 'xclbin', 'pdi', or None; got {value!r}"
             )
         self._output_format = value
+
+    # ---- device_columns ----
+
+    @property
+    def device_columns(self):
+        """Columns the kernel's design claims, or ``None`` for the whole array.
+
+        With ``n`` set, aircc targets the ``<npu>_<n>col`` device (e.g.
+        ``npu2_2col``), so the binary asks XRT for an ``n``-column partition
+        instead of all of them. The herd must fit in ``n`` columns. Narrow
+        designs leave room for other hw_contexts on the remaining columns.
+
+        Env var fallback: ``AMD_TRITON_NPU_DEVICE_COLUMNS``.
+        """
+        if self._device_columns is not MISSING:
+            return self._device_columns
+        v = os.getenv("AMD_TRITON_NPU_DEVICE_COLUMNS", "")
+        return int(v) if v else None
+
+    @device_columns.setter
+    def device_columns(self, value):
+        if value is not None and int(value) < 1:
+            raise ValueError(f"device_columns must be a positive int or None; got {value!r}")
+        self._device_columns = None if value is None else int(value)
 
     # ---- air_project_path ----
 
@@ -353,6 +378,7 @@ class _NPUConfig:
         self._transform_tiling_script = MISSING
         self._bf16_emulation = MISSING
         self._output_format = MISSING
+        self._device_columns = MISSING
         self._air_project_path = MISSING
         self._debug = MISSING
         self._target = MISSING
@@ -387,6 +413,7 @@ def set_config(**kwargs):
         "transform_tiling_script",
         "bf16_emulation",
         "output_format",
+        "device_columns",
         "air_project_path",
         "target",
         "runtime",
