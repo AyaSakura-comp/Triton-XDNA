@@ -45,6 +45,12 @@ struct Hit {
   xrt::bo *parent = nullptr;
   size_t offset = 0;
   bool is_static = false;
+  // Written by the NPU only: the host does not write it, so a launch need not
+  // flush it before the run.
+  bool device_writes = false;
+  // Whether a launch syncs it back after the run. Off when the host
+  // invalidates the lines itself before reading them (in parallel, say).
+  bool sync_back = true;
 };
 
 // Look up [ptr, ptr + nbytes). True when the whole range lies inside one
@@ -61,6 +67,7 @@ void *tnpu_alloc(size_t nbytes, int is_static);
 void tnpu_free(void *ptr);
 // Change whether an allocation is static. Marking one static syncs it.
 int tnpu_set_static(void *ptr, int is_static);
+int tnpu_set_device_writes(void *ptr, int device_writes, int sync_back);
 // Push host writes in [ptr, ptr + nbytes) to the device.
 int tnpu_flush(void *ptr, size_t nbytes);
 // Base address and size of the allocation containing ptr; 0 if none.

@@ -29,6 +29,8 @@ directly:
 
 * Write a static tensor from the host only through ``update`` (or call
   ``flush`` afterwards), since launches do not sync it.
+* Do not write a tensor marked ``set_device_writes`` (a kernel output) from
+  the host; launches do not flush it before the run.
 * A tensor's pages go back to the NPU driver when the last view of it dies.
 
 Only the XRT ELF launcher (NPU2) knows about them. Elsewhere -- xclbin, HSA,
@@ -53,6 +55,7 @@ __all__ = [
     "is_resident",
     "is_static",
     "set_static",
+    "set_device_writes",
     "update",
     "flush",
     "usage",
@@ -79,6 +82,7 @@ def _library() -> ctypes.CDLL:
             lib.tnpu_alloc.argtypes = [ctypes.c_size_t, ctypes.c_int]
             lib.tnpu_free.argtypes = [ctypes.c_void_p]
             lib.tnpu_set_static.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            lib.tnpu_set_device_writes.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             lib.tnpu_flush.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
             lib.tnpu_lookup.restype = ctypes.c_size_t
             lib.tnpu_lookup.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
@@ -157,6 +161,24 @@ def set_static(t: torch.Tensor, static: bool = True) -> None:
     if _library().tnpu_set_static(t.data_ptr(), int(static)) != 0:
         raise ValueError("not an NPU-resident tensor")
     _static[_base(t)] = static
+
+
+def set_device_writes(t: torch.Tensor, device_writes: bool = True, sync_back: bool = True) -> None:
+    """Mark the allocation holding ``t`` as written by the NPU only -- a kernel's output.
+
+    A launch then does not flush its pages before the run, only syncs them
+    back after it; for a large output the syncs are most of the launch's host
+    time (each is a cache flush over the bytes, on the launching thread). The
+    host may read it but must not write it while it is marked: a dirty cache
+    line written back later would overwrite the NPU's result.
+
+    ``sync_back=False`` skips the sync after the run too. The NPU does not
+    snoop the CPU's caches, so the host must then evict the lines it is about
+    to read itself (clflushopt + mfence over them, after the launch returns)
+    or it can read stale data.
+    """
+    if _library().tnpu_set_device_writes(t.data_ptr(), int(device_writes), int(sync_back)) != 0:
+        raise ValueError("not an NPU-resident tensor")
 
 
 def flush(t: torch.Tensor) -> None:

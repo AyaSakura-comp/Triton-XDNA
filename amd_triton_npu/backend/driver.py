@@ -2009,11 +2009,13 @@ def _generate_elf_launcher(constants, signature, kernel_name, written=None, resi
         if not resident:
             return f"xrt::bo* bo{i}; {{ {stage} }}"
         # A static allocation holds what the host does not write, so it was
-        # synced when marked and is not synced per launch.
+        # synced when marked and is not synced per launch; nor is one only the
+        # NPU writes (an output), whose results are synced back after the run.
         return (
             f"tnpu::Hit hit{i}; xrt::bo* bo{i}; "
             f"if (tnpu::find(arg{i}, size{i}, hit{i})) {{ bo{i} = hit{i}.bo; "
-            f"if (!hit{i}.is_static) hit{i}.parent->sync(XCL_BO_SYNC_BO_TO_DEVICE, size{i}, hit{i}.offset); }} "
+            f"if (!hit{i}.is_static && !hit{i}.device_writes) "
+            f"hit{i}.parent->sync(XCL_BO_SYNC_BO_TO_DEVICE, size{i}, hit{i}.offset); }} "
             f"else {{ hit{i}.parent = nullptr; {stage} }}"
         )
 
@@ -2025,7 +2027,8 @@ def _generate_elf_launcher(constants, signature, kernel_name, written=None, resi
         if not resident:
             return copy_back
         return (
-            f"if (hit{i}.parent) hit{i}.parent->sync(XCL_BO_SYNC_BO_FROM_DEVICE, size{i}, hit{i}.offset); "
+            f"if (hit{i}.parent) {{ if (hit{i}.sync_back) "
+            f"hit{i}.parent->sync(XCL_BO_SYNC_BO_FROM_DEVICE, size{i}, hit{i}.offset); }} "
             f"else {{ {copy_back} }}"
         )
 

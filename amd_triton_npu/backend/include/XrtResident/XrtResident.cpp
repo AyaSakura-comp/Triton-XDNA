@@ -21,6 +21,8 @@ struct Allocation {
   // Sub-buffers handed out for views, by (offset, size). A view is usually
   // launched many times, and building a sub-BO is an ioctl.
   std::map<std::pair<size_t, size_t>, std::unique_ptr<xrt::bo>> views;
+  bool device_writes = false;
+  bool sync_back = true;
 };
 
 std::mutex &registry_mutex() {
@@ -71,6 +73,8 @@ bool find(const void *ptr, size_t nbytes, Hit &hit) {
   hit.parent = &a->bo;
   hit.offset = offset;
   hit.is_static = a->is_static;
+  hit.device_writes = a->device_writes;
+  hit.sync_back = a->sync_back;
   if (offset == 0) {
     // A prefix view needs no sub-buffer: the kernel only touches the bytes
     // the argument covers, and those start at the BO's base.
@@ -118,6 +122,20 @@ int tnpu_set_static(void *ptr, int is_static) {
     return -1;
   a->is_static = is_static != 0;
   if (a->is_static)
+    a->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  return 0;
+}
+
+int tnpu_set_device_writes(void *ptr, int device_writes, int sync_back) {
+  std::lock_guard<std::mutex> lock(registry_mutex());
+  Allocation *a = containing(ptr, 1, nullptr);
+  if (!a)
+    return -1;
+  a->device_writes = device_writes != 0;
+  a->sync_back = !a->device_writes || sync_back != 0;
+  // Push whatever the host wrote so far (the zero fill at least) out of the
+  // caches once; from here on no line of it can be dirty.
+  if (a->device_writes)
     a->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   return 0;
 }
