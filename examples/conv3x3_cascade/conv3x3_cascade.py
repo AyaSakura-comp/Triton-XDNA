@@ -4,12 +4,15 @@
 """tl.extra.npu.conv3x3: a 3x3 int8 convolution over the whole array.
 
 Every core keeps its weights for the whole image; the input-channel reduction is split
-across two cores whose partial sums meet over the AIE cascade (see
-amd_triton_npu/language/npu/conv3x3.py). Checks five shapes against the CPU (the same
-integers, bit for bit), each at two shifts (the second one set without a rebuild),
-and with --bench times large ones: NPU time alone, and per call with the host layouts.
+across a chain of cores whose partial sums meet over the AIE cascade (see
+amd_triton_npu/language/npu/conv3x3.py). Checks shapes that exercise every way the op
+splits a layer (chains of 2 and 4 cores, 1-4 partitions, narrow tiles side by side,
+padded channels, batches) against the CPU -- the same integers, bit for bit -- the
+first at a second shift set without a rebuild; then all of them again, interleaved, as
+the kernels of one shared ELF (`share_context`, how a model's layers run); and with
+--bench times large ones: NPU time alone, and per call with the host layouts.
 
-usage: python conv3x3_cascade.py [--bench] [--iters N]
+usage: python conv3x3_cascade.py [--bench] [--iters N] [--quick]
 Exit status: 0 pass, 1 failure.
 """
 
@@ -21,24 +24,37 @@ import torch
 
 from triton.language.extra.npu import conv3x3
 
+SHAPES = [  # (N, Ci, Co, H, W, relu)
+    (1, 256, 256, 64, 64, False),
+    (2, 3, 64, 24, 40, False),
+    (1, 64, 128, 20, 28, True),
+    (1, 512, 512, 14, 14, False),
+    (3, 384, 96, 9, 7, False),
+    (1, 128, 256, 16, 100, True),
+]
 
-def check(ci, co, h, w, relu=False, shift=12):
-    rng = np.random.default_rng(ci * 7 + co + h + w)
-    x = torch.as_tensor(rng.integers(-60, 60, (ci, h, w), dtype=np.int8))
+
+def verdict(op, x, label):
+    y = op(x)
+    want = op.reference(x)
+    same = torch.equal(y, want)
+    diff = "" if same else f" ({int((y != want).sum())} of {y.numel()} differ)"
+    print(f"{label}: {'PASS' if same else 'FAIL'}{diff}")
+    return same
+
+
+def check(n, ci, co, h, w, relu=False, shifts=(12,)):
+    rng = np.random.default_rng(ci * 7 + co + h + w + n)
+    x = torch.as_tensor(rng.integers(-60, 60, (n, ci, h, w), dtype=np.int8))
     wt = torch.as_tensor(rng.integers(-40, 40, (co, ci, 3, 3), dtype=np.int8))
-    op = conv3x3.Conv3x3(wt, height=h, width=w, shift=shift, relu=relu)
+    op = conv3x3.Conv3x3(wt, height=h, width=w, shift=shifts[0], relu=relu, batch=n)
+    cfg = f"L={op.chain} CG={op.cg} OGP={op.ogp} G={op.groups} R={op.parts}"
     ok = True
-    for s in (shift, shift - 2):
-        if s != shift:
+    for s in shifts:
+        if s != op.shift:
             op.set_shift(s)
-        y = op(x)
-        want = op.reference(x)
-        same = torch.equal(y, want)
-        diff = "" if same else f" ({int((y != want).sum())} of {y.numel()} differ)"
-        verdict = "PASS" if same else "FAIL"
-        print(f"Ci={ci} Co={co} H={h} W={w} relu={relu} shift={s}: {verdict}{diff}")
-        ok &= same
-    return ok
+        ok &= verdict(op, x, f"{n}x{ci}x{h}x{w} -> {co} relu={relu} shift={s} [{cfg}]")
+    return ok, op, x
 
 
 def median_ms(fn, iters):
@@ -51,21 +67,16 @@ def median_ms(fn, iters):
     return sorted(ts)[len(ts) // 2] * 1e3
 
 
-def bench(ci, co, h, w, iters):
+def bench(n, ci, co, h, w, iters):
     rng = np.random.default_rng(0)
-    x = torch.as_tensor(rng.integers(-60, 60, (ci, h, w), dtype=np.int8))
+    x = torch.as_tensor(rng.integers(-60, 60, (n, ci, h, w), dtype=np.int8))
     wt = torch.as_tensor(rng.integers(-40, 40, (co, ci, 3, 3), dtype=np.int8))
-    op = conv3x3.Conv3x3(wt, height=h, width=w, shift=12)
-
-    def launches():
-        for _, _, prog, (xbo, _), (wbo, _), (ybo, _) in op.slabs:
-            prog.run(xbo, wbo, ybo)
-
-    npu = median_ms(launches, iters)
+    op = conv3x3.Conv3x3(wt, height=h, width=w, shift=12, batch=n)
+    npu = median_ms(op.launch, iters)
     call = median_ms(lambda: op(x), iters)
-    gop = 2 * ci * co * h * w * 9 / 1e9
+    gop = 2 * n * ci * co * h * w * 9 / 1e9
     print(
-        f"Ci={ci} Co={co} {h}x{w}: NPU {npu:.3f} ms = {gop / npu:.1f} TOPS; "
+        f"{n}x{ci}x{h}x{w} -> {co}: NPU {npu:.3f} ms = {gop / npu:.1f} TOPS; "
         f"per call with host layouts {call:.3f} ms = {gop / call:.1f} TOPS"
     )
 
@@ -74,17 +85,18 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--iters", type=int, default=10)
+    ap.add_argument("--quick", action="store_true", help="the first shape only")
     a = ap.parse_args()
-    ok = all(
-        [
-            check(256, 256, 64, 64),
-            check(128, 256, 32, 128),
-            check(64, 512, 16, 64),
-            check(256, 64, 8, 64),
-            check(256, 256, 24, 64, relu=True),
-        ]
-    )
+    shapes = SHAPES[:1] if a.quick else SHAPES
+    runs = [check(*s[:5], relu=s[5], shifts=(12, 10) if i == 0 else (12,))
+            for i, s in enumerate(shapes)]  # fmt: skip
+    ok = all(r[0] for r in runs)
+    if len(runs) > 1 and conv3x3.program_format() == "elf":
+        conv3x3.share_context([op for _, op, _ in runs])
+        for rep in range(2):  # every launch follows another design's
+            for _, op, x in runs:
+                ok &= verdict(op, x, f"shared context, pass {rep}, {tuple(x.shape)}")
     if a.bench:
-        bench(256, 256, 1536, 64, a.iters)
-        bench(256, 256, 256, 256, a.iters)
+        bench(1, 256, 256, 1536, 64, a.iters)
+        bench(1, 256, 256, 256, 256, a.iters)
     raise SystemExit(0 if ok else 1)

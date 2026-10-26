@@ -187,9 +187,10 @@ EXAMPLES = [
         "datatypes": "i8 -> i8 / u8 (ReLU)",
         "description": (
             "An op, not a jit kernel: weights stay in every core for the whole "
-            "image, the input channels are split over two cores whose partial "
-            "sums meet over the AIE cascade. 52.6 TOPS (86% of int8 peak) on "
-            "Strix, bit-exact."
+            "image, the input channels are split over a chain of cores whose "
+            "partial sums meet over the AIE cascade. Any H x W and batch, Ci up "
+            "to 512; a model's layers share one hardware context. 52.6 TOPS "
+            "(86% of int8 peak) on Strix, bit-exact."
         ),
     },
     {
