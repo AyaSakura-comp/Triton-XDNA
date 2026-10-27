@@ -195,6 +195,19 @@ EXAMPLES = [
     },
     {
         "kind": "feature",
+        "name": "A Transformer Stack in One Launch (tl.extra.npu.qwen3_stack)",
+        "path": "qwen3_stack",
+        "datatypes": "bfp16 x bfp16 -> fp32",
+        "description": (
+            "An op: every layer of a Qwen3-0.6B-sized stack, the final norm and "
+            "a linear head for two sequences in one launch. GEMMs as cascade "
+            "chains with the norms, residuals and logits fused into the last "
+            "MAC; RoPE, q/k-norm and an online-softmax attention on all 32 "
+            "cores. OmniVoice's 28-layer step: 12.5-55 ms for 58-264 positions."
+        ),
+    },
+    {
+        "kind": "feature",
         "name": "Zero-Copy iGPU/NPU Buffers",
         "path": "zero_copy",
         "datatypes": "f32",

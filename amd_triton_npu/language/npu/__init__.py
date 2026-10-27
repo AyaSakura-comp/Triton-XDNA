@@ -23,7 +23,7 @@ from .fused_decode import (
     fused_decode,
 )
 from .fused_prefill import PrefillConfig, PrefillConfigError, fused_prefill
-from . import conv3x3
+from . import conv3x3, qwen3_stack
 
 __all__ = [
     "ENGINES",
@@ -35,4 +35,5 @@ __all__ = [
     "PrefillConfigError",
     "fused_prefill",
     "conv3x3",
+    "qwen3_stack",
 ]
